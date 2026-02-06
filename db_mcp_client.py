@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
-db_mcp_client.py
-----------------
-A tiny MCP stdio client you can use to test the DB MCP server WITHOUT Claude/any proprietary host.
+doc_mcp_client.py
+-----------------
+A tiny MCP stdio client to test the Documentation MCP server WITHOUT Claude/any proprietary host.
 
 Usage:
-  python db_mcp_client.py
-  python db_mcp_client.py --csv ./data/hr_people.csv
+  # Interactive mode (original)
+  python doc_mcp_client.py
+  
+  # Non-interactive JSON search mode
+  python doc_mcp_client.py --search "diabetes" --top-k 5
+  
+  # Batch JSON search mode (multiple queries)
+  python doc_mcp_client.py --batch-search queries.json
+  
+  # Output to JSON file
+  python doc_mcp_client.py --search "diabetes" --output results.json
 """
 from __future__ import annotations
 
@@ -16,9 +25,7 @@ import os
 import subprocess
 import sys
 import threading
-import time
-from typing import Any, Dict, Optional
-
+from typing import Any, Dict, Optional, List
 
 PROTOCOL_VERSION = "2025-11-25"
 
@@ -58,7 +65,6 @@ class MCPStdioClient:
         self._next_id += 1
         self.send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}})
 
-        # Wait for matching response
         assert self.proc.stdout
         while True:
             line = self.proc.stdout.readline()
@@ -83,56 +89,280 @@ class MCPStdioClient:
             pass
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--csv", default=os.path.join(os.path.dirname(__file__), "data", "hr_people.csv"))
-    args = ap.parse_args()
+def initialize_client(client: MCPStdioClient, verbose: bool = False) -> None:
+    """Initialize the MCP client connection."""
+    init = client.request(
+        "initialize",
+        {
+            "protocolVersion": PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "doc-mcp-cli", "version": "2.0.0"},
+        },
+    )
+    if verbose:
+        print("Initialize response:", file=sys.stderr)
+        print(json.dumps(init, indent=2), file=sys.stderr)
+    client.notify("notifications/initialized")
 
-    server_py = os.path.join(os.path.dirname(__file__), "db_mcp_server.py")
-    cmd = [sys.executable, server_py, args.csv]
 
-    client = MCPStdioClient(cmd)
-    try:
-        init = client.request(
-            "initialize",
-            {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},  # this demo client offers no optional features
-                "clientInfo": {"name": "db-mcp-cli", "version": "1.0.0"},
-            },
-        )
-        print("Initialize response:")
-        print(json.dumps(init, indent=2))
+def search_documents(client: MCPStdioClient, query: str, top_k: int = 5) -> Dict[str, Any]:
+    """Perform a document search and return results."""
+    response = client.request(
+        "tools/call",
+        {
+            "name": "doc_search",
+            "arguments": {
+                "query": query,
+                "top_k": top_k
+            }
+        }
+    )
+    return response
 
-        client.notify("notifications/initialized")
 
-        tools = client.request("tools/list", {})
-        print("\nTools:")
-        print(json.dumps(tools, indent=2))
+def batch_search(client: MCPStdioClient, queries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Perform multiple searches and return all results."""
+    results = []
+    for query_spec in queries:
+        query = query_spec.get("query", "")
+        top_k = query_spec.get("top_k", 5)
+        
+        result = {
+            "query": query,
+            "top_k": top_k,
+            "response": search_documents(client, query, top_k)
+        }
+        results.append(result)
+    
+    return results
 
-        # Sample query
-        sample = client.request(
-            "tools/call",
-            {"name": "hr_query", "arguments": {"sql": "SELECT department, COUNT(*) AS n FROM employees GROUP BY department ORDER BY n DESC"}},
-        )
-        print("\nSample hr_query result:")
-        print(json.dumps(sample, indent=2))
 
-        # Interactive loop
-        print("\nInteractive mode. Type SQL (SELECT ...) or 'exit'.")
-        while True:
-            try:
-                sql = input("SQL> ").strip()
-            except EOFError:
-                break
-            if not sql:
+def list_resources(client: MCPStdioClient) -> Dict[str, Any]:
+    """List all available resources."""
+    return client.request("resources/list", {})
+
+
+def read_resource(client: MCPStdioClient, uri: str) -> Dict[str, Any]:
+    """Read a specific resource by URI."""
+    return client.request("resources/read", {"uri": uri})
+
+
+def interactive_mode(client: MCPStdioClient) -> None:
+    """Run the client in interactive mode."""
+    print("\n=== Interactive Mode ===")
+    print("Commands:")
+    print("  search <query>  - Search documents")
+    print("  list            - List all resources")
+    print("  read <uri>      - Read a specific resource")
+    print("  exit/quit       - Exit interactive mode")
+    print()
+    
+    while True:
+        try:
+            command = input("DOC-MCP> ").strip()
+        except EOFError:
+            break
+        
+        if not command:
+            continue
+        
+        if command.lower() in ("exit", "quit"):
+            break
+        
+        parts = command.split(maxsplit=1)
+        cmd = parts[0].lower()
+        
+        if cmd == "search":
+            if len(parts) < 2:
+                print("Usage: search <query>")
                 continue
-            if sql.lower() in ("exit", "quit"):
-                break
-            resp = client.request("tools/call", {"name": "hr_query", "arguments": {"sql": sql, "limit": 50}})
+            query = parts[1]
+            resp = search_documents(client, query, top_k=5)
             print(json.dumps(resp, indent=2))
+        
+        elif cmd == "list":
+            resp = list_resources(client)
+            print(json.dumps(resp, indent=2))
+        
+        elif cmd == "read":
+            if len(parts) < 2:
+                print("Usage: read <uri>")
+                continue
+            uri = parts[1]
+            resp = read_resource(client, uri)
+            # Show first 500 chars of content
+            text = resp.get("result", {}).get("contents", [{}])[0].get("text", "")
+            print(f"Resource: {uri}")
+            print(text[:500])
+            if len(text) > 500:
+                print(f"\n... (truncated, total {len(text)} chars)")
+        
+        else:
+            print(f"Unknown command: {cmd}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Documentation MCP Client - Interactive and JSON-based search",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Interactive mode
+  python doc_mcp_client.py
+  
+  # Single search query
+  python doc_mcp_client.py --search "diabetes treatment" --top-k 10
+  
+  # Batch search from JSON file
+  python doc_mcp_client.py --batch-search queries.json
+  
+  # Output to JSON file
+  python doc_mcp_client.py --search "hypertension" --output results.json
+  
+  # List all resources
+  python doc_mcp_client.py --list-resources
+  
+  # Read specific resource
+  python doc_mcp_client.py --read-resource "doc://policy.md"
+
+Batch search JSON format (queries.json):
+  [
+    {"query": "diabetes", "top_k": 5},
+    {"query": "hypertension", "top_k": 10},
+    {"query": "medication guidelines", "top_k": 3}
+  ]
+        """
+    )
+    
+    # Mode selection
+    parser.add_argument(
+        "--search", "-s",
+        type=str,
+        help="Single search query (non-interactive mode)"
+    )
+    
+    parser.add_argument(
+        "--top-k", "-k",
+        type=int,
+        default=5,
+        help="Number of top results to return (default: 5)"
+    )
+    
+    parser.add_argument(
+        "--batch-search", "-b",
+        type=str,
+        help="Path to JSON file with multiple search queries"
+    )
+    
+    parser.add_argument(
+        "--output", "-o",
+        type=str,
+        help="Output results to JSON file instead of stdout"
+    )
+    
+    parser.add_argument(
+        "--list-resources",
+        action="store_true",
+        help="List all available resources"
+    )
+    
+    parser.add_argument(
+        "--read-resource",
+        type=str,
+        help="Read a specific resource by URI"
+    )
+    
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Verbose output (show initialization details)"
+    )
+    
+    parser.add_argument(
+        "--server",
+        type=str,
+        default=None,
+        help="Path to doc_mcp_server.py (auto-detected if not provided)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Determine server path
+    if args.server:
+        server_py = args.server
+    else:
+        server_py = os.path.join(os.path.dirname(__file__), "doc_mcp_server.py")
+    
+    if not os.path.exists(server_py):
+        print(f"Error: Server not found at {server_py}", file=sys.stderr)
+        return 1
+    
+    # Start client
+    cmd = [sys.executable, server_py]
+    client = MCPStdioClient(cmd)
+    
+    try:
+        # Initialize
+        initialize_client(client, verbose=args.verbose)
+        
+        # Determine mode
+        output_data = None
+        
+        if args.list_resources:
+            # List resources mode
+            output_data = list_resources(client)
+        
+        elif args.read_resource:
+            # Read resource mode
+            output_data = read_resource(client, args.read_resource)
+        
+        elif args.search:
+            # Single search mode
+            output_data = search_documents(client, args.search, args.top_k)
+        
+        elif args.batch_search:
+            # Batch search mode
+            if not os.path.exists(args.batch_search):
+                print(f"Error: Batch file not found: {args.batch_search}", file=sys.stderr)
+                return 1
+            
+            with open(args.batch_search, 'r', encoding='utf-8') as f:
+                queries = json.load(f)
+            
+            if not isinstance(queries, list):
+                print("Error: Batch search file must contain a JSON array", file=sys.stderr)
+                return 1
+            
+            output_data = {
+                "batch_results": batch_search(client, queries),
+                "total_queries": len(queries)
+            }
+        
+        else:
+            # Interactive mode (default)
+            interactive_mode(client)
+            return 0
+        
+        # Handle output
+        if output_data:
+            if args.output:
+                # Write to file
+                with open(args.output, 'w', encoding='utf-8') as f:
+                    json.dump(output_data, f, indent=2, ensure_ascii=False)
+                print(f"Results written to {args.output}", file=sys.stderr)
+            else:
+                # Print to stdout
+                print(json.dumps(output_data, indent=2, ensure_ascii=False))
+    
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+    
     finally:
         client.close()
+    
     return 0
 
 
